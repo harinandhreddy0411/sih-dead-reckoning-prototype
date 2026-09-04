@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
 
-VTA16_PATH = r"Synchronised V abd S datasets\Categorised IOVNB Dataset\Vta (Driver E)\Vta16\S-Vta16.csv"
+VTA16_PATH = "data/S-Vta16.csv"
 MODEL_CHECKPOINT_PATH = "session1_velocity_model.pt"
 
 SAMPLE_RATE_HZ = 10.0
@@ -20,8 +20,8 @@ BLACKOUT_START_INDEX = 100
 MAX_PLAUSIBLE_SPEED_MS = 15.0
 MIN_PLAUSIBLE_SPEED_MS = 0.0
 
-R_V_CLASSICAL = 2.0
-R_V_AI = 2.0
+R_V_CLASSICAL = 2.66 ** 2   # = 7.0756 — measured classical-velocity RMSE^2 (m/s)^2
+R_V_AI = 0.33 ** 2          # = 0.1089 — measured AI-velocity RMSE^2 (m/s)^2
 
 
 class SpeedCorrectionLstm(nn.Module):
@@ -53,7 +53,53 @@ def loadSequence(csvPath):
     east = (np.radians(lon) - refLon) * np.cos(refLat) * EARTH_RADIUS_METERS
     north = (np.radians(lat) - refLat) * EARTH_RADIUS_METERS
 
-    return linearAccel, gyro, headingDeg, east.astype(np.float32), north.astype(np.float32), speedKmh / 3.6
+    speed = speedKmh / 3.6
+    east, north = reconstructGpsPositions(east, north, speed, headingDeg)
+    return linearAccel, gyro, headingDeg, east.astype(np.float32), north.astype(np.float32), speed
+
+
+def reconstructGpsPositions(east, north, speed, headingDeg, maxSpeedMs=MAX_PLAUSIBLE_SPEED_MS):
+    """A held (stale) fix followed by a jump is only trustworthy if the jump
+    distance is plausible GIVEN the actual hold duration (jumpDist / (runLen*DT)),
+    not a fixed single-sample threshold. When implausible, the raw fix is
+    corrupted (not just noisy) -- discard it and dead-reckon that span using
+    the independent GPS-speed + heading signal from the last trusted fix,
+    same treatment the EKF already gives a real blackout."""
+    n = len(east)
+    headingRad = np.radians(headingDeg)
+    fixedEast, fixedNorth = east.copy(), north.copy()
+    stepDist = np.sqrt(np.diff(east) ** 2 + np.diff(north) ** 2)
+    isStale = stepDist == 0.0
+    lastE, lastN = east[0], north[0]
+    untrustedCount = 0
+    i = 0
+    while i < n - 1:
+        if isStale[i]:
+            a = i
+            j = i
+            while j < n - 1 and isStale[j]:
+                j += 1
+            hasJump = j < n - 1
+            runLen = max(j - a, 1)
+            impliedSpeed = (stepDist[j] / (runLen * DT)) if hasJump else 0.0
+            trusted = hasJump and impliedSpeed <= maxSpeedMs
+            b = j + 1 if hasJump else n - 1
+            for k in range(a + 1, b + 1):
+                if trusted and k == b:
+                    lastE, lastN = east[k], north[k]
+                else:
+                    lastE = lastE + speed[k - 1] * np.sin(headingRad[k - 1]) * DT
+                    lastN = lastN + speed[k - 1] * np.cos(headingRad[k - 1]) * DT
+                    untrustedCount += 1
+                fixedEast[k], fixedNorth[k] = lastE, lastN
+            i = b if hasJump else n
+        else:
+            lastE, lastN = east[i + 1], north[i + 1]
+            i += 1
+    if untrustedCount:
+        print(f"reconstructGpsPositions: dead-reckoned {untrustedCount} corrupted-fix sample(s) "
+              f"using GPS-speed+heading instead of trusting raw lat/lon")
+    return fixedEast, fixedNorth
 
 
 def loadModel():
