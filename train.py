@@ -26,6 +26,7 @@ TRAINING_EPOCHS = 15
 MODEL_CHECKPOINT_PATH = "session1_velocity_model.pt"
 
 VTA16_PATH = r"Synchronised V abd S datasets\Categorised IOVNB Dataset\Vta (Driver E)\Vta16\S-Vta16.csv"
+SESSION_PATHS = ["data/S-Vta16.csv", "data/S-Vta2.csv"]
 
 
 def convertGpsTrackToLocalEnuMeters(latitudeDegrees, longitudeDegrees):
@@ -130,6 +131,63 @@ def evaluateBlackoutReconstructionFromData(speedModel, sequenceData, blackoutDur
     print("saved blackout_reconstruction.png")
 
 
+def trainOnDataset(trainingDataset, epochs=TRAINING_EPOCHS):
+    trainingDataLoader = DataLoader(trainingDataset, batch_size=TRAINING_BATCH_SIZE, shuffle=True)
+    speedModel = SpeedCorrectionLstm(inputFeatureCount=8, hiddenSize=LSTM_HIDDEN_SIZE, numLayers=LSTM_NUM_LAYERS)
+    optimizer = torch.optim.Adam(speedModel.parameters(), lr=TRAINING_LEARNING_RATE)
+    lossFunction = nn.MSELoss()
+    for epochIndex in range(epochs):
+        speedModel.train()
+        accumulatedEpochLoss = 0.0
+        for imuWindowBatch, targetSpeedBatch in trainingDataLoader:
+            optimizer.zero_grad()
+            batchLoss = lossFunction(speedModel(imuWindowBatch), targetSpeedBatch)
+            batchLoss.backward()
+            optimizer.step()
+            accumulatedEpochLoss += batchLoss.item()
+        print(f"epoch {epochIndex + 1}/{epochs} mean_loss {accumulatedEpochLoss / len(trainingDataLoader):.4f}")
+    return speedModel
+
+
+def evaluateVelocityRmse(speedModel, sequenceData):
+    dataset = ImuSpeedWindowDataset(sequenceData, WINDOW_LENGTH_SAMPLES)
+    speedModel.eval()
+    errs = []
+    with torch.no_grad():
+        for i in range(len(dataset)):
+            imuWindow, target = dataset[i]
+            pred = speedModel(imuWindow.unsqueeze(0)).item()
+            errs.append(pred - target.item())
+    return float(np.sqrt(np.mean(np.square(errs))))
+
+
+def leaveOneSessionOut(sessionPaths):
+    """Honest generalization check: train on all-but-one session, evaluate
+    velocity RMSE on the held-out session. Does NOT touch the deployed
+    checkpoint -- diagnostic only."""
+    sequences = [loadSequenceFromCsv(p) for p in sessionPaths]
+    print("\n=== Leave-one-session-out validation ===")
+    for holdoutIdx, holdoutPath in enumerate(sessionPaths):
+        trainSeqs = [s for i, s in enumerate(sequences) if i != holdoutIdx]
+        trainDatasets = [ImuSpeedWindowDataset(s, WINDOW_LENGTH_SAMPLES) for s in trainSeqs]
+        combinedTrain = torch.utils.data.ConcatDataset(trainDatasets)
+        model = trainOnDataset(combinedTrain)
+        rmse = evaluateVelocityRmse(model, sequences[holdoutIdx])
+        print(f"held out {holdoutPath}: velocity RMSE = {rmse:.3f} m/s")
+
+
+def trainFinalModelOnAllSessions(sessionPaths):
+    """Deployed checkpoint: trained on the union of all available sessions."""
+    sequences = [loadSequenceFromCsv(p) for p in sessionPaths]
+    datasets = [ImuSpeedWindowDataset(s, WINDOW_LENGTH_SAMPLES) for s in sequences]
+    combined = torch.utils.data.ConcatDataset(datasets)
+    speedModel = trainOnDataset(combined)
+    torch.save(speedModel.state_dict(), MODEL_CHECKPOINT_PATH)
+    print(f"saved {MODEL_CHECKPOINT_PATH} (trained on {len(sessionPaths)} sessions combined)")
+    evaluateBlackoutReconstructionFromData(speedModel, sequences[0])
+    return speedModel
+
+
 def trainSpeedModelSingleSession(csvFilePath, trainFraction=0.8):
     fullSequenceData = loadSequenceFromCsv(csvFilePath)
     totalSampleCount = len(fullSequenceData["eastMeters"])
@@ -167,4 +225,5 @@ def trainSpeedModelSingleSession(csvFilePath, trainFraction=0.8):
 
 
 if __name__ == "__main__":
-    trainSpeedModelSingleSession(VTA16_PATH)
+    leaveOneSessionOut(SESSION_PATHS)
+    trainFinalModelOnAllSessions(SESSION_PATHS)
